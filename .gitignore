@@ -1,0 +1,3 @@
+# Holds your OpenAI key. Never commit it (server.py recreates it with a placeholder if missing).
+config.json
+__pycache__/
