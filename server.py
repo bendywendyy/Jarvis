@@ -7,8 +7,9 @@ GET  /...          static files from viewer/ only (nothing else on disk is reach
 POST /chat         {"question": "...", "session": "..."} -> {"answer": "...", "nodes": [ids]}
 POST /chat/reset   {"session": "..."} clears that browser's conversation history
 
-The OpenAI key lives in config.json in the project root. It is read on every request
-(so you can paste it in without restarting) and is never sent to the browser.
+The brain is Claude Opus 5.5 (Anthropic Messages API). The key lives in config.json in the
+project root. It is read on every request (so you can paste it in without restarting) and is
+never sent to the browser.
 Standard library only.
 """
 import json
@@ -33,9 +34,14 @@ INDEX_PATH = ROOT / "notes-index.json"
 HOST, PORT = "127.0.0.1", 4700
 
 PLACEHOLDER_KEY = "PUT-YOUR-KEY-HERE"
-DEFAULT_CONFIG = {"openai_api_key": PLACEHOLDER_KEY, "model": "gpt-5-5 Opus"}
-OPENAI_URL = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/") + "/chat/completions"
-OPENAI_TIMEOUT = 90
+DEFAULT_CONFIG = {"anthropic_api_key": PLACEHOLDER_KEY, "model": "claude-opus-5-5"}
+# Raw HTTP on purpose: server.py is standard-library only, so no `anthropic` SDK.
+ANTHROPIC_URL = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com").rstrip("/") + "/v1/messages"
+ANTHROPIC_VERSION = "2023-06-01"
+FALLBACK_BETA = "server-side-fallback-2026-07-01"  # a declined request is retried on the model Anthropic recommends
+REQUEST_TIMEOUT = 90
+MAX_TOKENS = 16000        # thinking is always on for Opus 5.5 and counts toward this, so leave room
+EFFORT = "low"            # short grounded answers, spoken aloud: favour a fast first word; try "medium" if answers feel thin
 
 TOP_K = 6                 # notes sent to the model per question
 NOTE_CHARS = 3000         # max characters of each note sent to the model
@@ -155,6 +161,7 @@ SYSTEM_PROMPT = """You are the memory of the user's personal notes. Answer ONLY 
 Never use outside knowledge, and never guess.
 Answer in two or three sentences, plainly. If the notes do not cover the question, say so plainly \
 (for example: "Your notes don't cover that.") instead of answering.
+Your answer is read aloud, so write natural spoken sentences: no markdown, bullet points or tables.
 Reply with a single JSON object and nothing else:
 {"answer": "<your two or three sentences>", "used": [<id numbers of the notes you actually relied on>]}
 Use "used": [] when the notes don't cover it.
@@ -163,13 +170,17 @@ NOTES:
 """
 
 
-def build_messages(question, notes, history):
+def build_request(question, notes, history):
+    """System prompt carrying this question's notes, plus the short text-only history.
+
+    History holds only plain question/answer text (never thinking blocks), so the fresh notes
+    in the system prompt each turn don't trip Opus 5.5's preserved-thinking prefix check."""
     blocks = []
     for n in notes:
         text = n["text"] if len(n["text"]) <= NOTE_CHARS else n["text"][:NOTE_CHARS] + " …"
         blocks.append(f"[id {n['id']}] {n['label']} (folder: {n['group']})\n{text}")
     context = "\n\n---\n\n".join(blocks) if blocks else "(no notes matched this question)"
-    return [{"role": "system", "content": SYSTEM_PROMPT + context}, *history, {"role": "user", "content": question}]
+    return SYSTEM_PROMPT + context, [*history, {"role": "user", "content": question}]
 
 
 class ChatError(Exception):
@@ -186,46 +197,79 @@ def load_config():
     except (json.JSONDecodeError, UnicodeDecodeError) as e:
         raise ChatError(500, f"config.json isn't valid JSON ({e}). Check the quotes and commas.")
     if not isinstance(cfg, dict):
-        raise ChatError(500, "config.json should be a JSON object with openai_api_key and model.")
-    key = str(cfg.get("openai_api_key") or "").strip()
+        raise ChatError(500, "config.json should be a JSON object with anthropic_api_key and model.")
+    if "anthropic_api_key" not in cfg and "openai_api_key" in cfg:
+        raise ChatError(503, "config.json is still in the old OpenAI format. The brain now runs on Claude Opus 5.5: "
+                             'rename "openai_api_key" to "anthropic_api_key", paste an Anthropic key, '
+                             'and set "model" to "claude-opus-5-5".')
+    key = str(cfg.get("anthropic_api_key") or "").strip()
     model = str(cfg.get("model") or "").strip()
     if not key or key == PLACEHOLDER_KEY or key.startswith("PUT-"):
-        raise ChatError(503, "No OpenAI API key yet. Open config.json in the project root, replace "
+        raise ChatError(503, "No Anthropic API key yet. Open config.json in the project root, replace "
                              "PUT-YOUR-KEY-HERE with your key, save, and ask again (no restart needed).")
     if not model:
-        raise ChatError(503, 'config.json has no "model" set. Add the OpenAI model name to use.')
+        raise ChatError(503, 'config.json has no "model" set. Use "claude-opus-5-5".')
     return key, model
 
 
-def call_openai(key, model, messages):
-    body = json.dumps({"model": model, "messages": messages}).encode("utf-8")
-    req = urllib.request.Request(OPENAI_URL, data=body, method="POST", headers={
-        "Authorization": f"Bearer {key}",
-        "Content-Type": "application/json",
-    })
+_fallbacks_ok = True      # switched off for this run if the API ever rejects the fallback option
+
+
+def call_claude(key, model, system, messages):
+    """One Messages API call. Returns the answer text (thinking blocks are skipped)."""
+    global _fallbacks_ok
+    body = {
+        "model": model,
+        "max_tokens": MAX_TOKENS,
+        "system": system,
+        "messages": messages,
+        "output_config": {"effort": EFFORT},   # no `thinking` field: Opus 5.5 always thinks; effort sets how much
+    }
+    headers = {
+        "x-api-key": key,
+        "anthropic-version": ANTHROPIC_VERSION,
+        "content-type": "application/json",
+    }
+    if _fallbacks_ok:
+        body["fallbacks"] = "default"
+        headers["anthropic-beta"] = FALLBACK_BETA
+    req = urllib.request.Request(ANTHROPIC_URL, data=json.dumps(body).encode("utf-8"), method="POST", headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=OPENAI_TIMEOUT) as resp:
+        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         try:
-            detail = json.loads(e.read().decode("utf-8")).get("error", {}).get("message", "")
+            err = json.loads(e.read().decode("utf-8")).get("error", {})
         except Exception:
-            detail = ""
+            err = {}
+        detail = err.get("message") or e.reason
+        if e.code == 400 and _fallbacks_ok and "fallback" in str(detail).lower():
+            _fallbacks_ok = False                 # the fallback option isn't available here: carry on without it
+            sys.stderr.write("  note: server-side fallbacks unavailable, continuing without them\n")
+            return call_claude(key, model, system, messages)
         if e.code == 401:
-            raise ChatError(502, "OpenAI rejected the API key in config.json (401). Check it was pasted in full.")
-        raise ChatError(502, f"OpenAI returned an error ({e.code}): {detail or e.reason}")
+            raise ChatError(502, "Anthropic rejected the API key in config.json (401). Check it was pasted in full "
+                                 "(Anthropic keys start with sk-ant-).")
+        if e.code == 404:
+            raise ChatError(502, f"Anthropic doesn't recognise the model in config.json ({detail}).")
+        if e.code == 429:
+            raise ChatError(502, "Anthropic's rate limit was hit (429). Wait a moment and ask again.")
+        if e.code >= 500:
+            raise ChatError(502, f"Anthropic is overloaded or having trouble ({e.code}). Try again shortly.")
+        raise ChatError(502, f"Anthropic returned an error ({e.code}): {detail}")
     except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError) as e:
         reason = getattr(e, "reason", e)
-        raise ChatError(504, f"Couldn't reach OpenAI ({reason}). Check your internet connection and try again.")
+        raise ChatError(504, f"Couldn't reach Anthropic ({reason}). Check your internet connection and try again.")
     except json.JSONDecodeError:
-        raise ChatError(502, "OpenAI sent back something that wasn't JSON. Try again.")
-    try:
-        content = data["choices"][0]["message"].get("content") or ""
-    except (KeyError, IndexError, TypeError, AttributeError):
-        raise ChatError(502, "OpenAI's reply had an unexpected shape. Try again.")
-    if not content.strip():
-        raise ChatError(502, "OpenAI returned an empty answer. Try rephrasing the question.")
-    return content
+        raise ChatError(502, "Anthropic sent back something that wasn't JSON. Try again.")
+
+    if data.get("stop_reason") == "refusal":
+        raise ChatError(502, "Claude declined to answer that one. Try rephrasing the question.")
+    blocks = data.get("content") if isinstance(data.get("content"), list) else []
+    text = "".join(b.get("text", "") for b in blocks if isinstance(b, dict) and b.get("type") == "text")
+    if not text.strip():
+        raise ChatError(502, "Claude returned an empty answer. Try rephrasing the question.")
+    return text
 
 
 def parse_reply(content, retrieved_ids):
@@ -294,7 +338,8 @@ def answer(question, sid):
         key, model = load_config()
         if not notes and not state["history"]:
             return {"answer": "Your notes don't seem to cover that. Nothing matched those words.", "nodes": []}
-        content = call_openai(key, model, build_messages(question, notes, state["history"]))
+        system, messages = build_request(question, notes, state["history"])
+        content = call_claude(key, model, system, messages)
     except ChatError as e:
         e.nodes = ids                                   # the galaxy can still light up the best matches
         raise
@@ -359,7 +404,7 @@ class Handler(BaseHTTPRequestHandler):
         if route not in ("/chat", "/chat/reset"):
             self.send_json(404, {"error": "Not found"})
             return
-        # Only this page may call /chat: blocks other websites from spending your OpenAI credit.
+        # Only this page may call /chat: blocks other websites from spending your API credit.
         origin = self.headers.get("Origin")
         if origin and urlsplit(origin).netloc != self.headers.get("Host"):
             self.send_json(403, {"error": "Cross-origin requests are not allowed."})
@@ -410,13 +455,13 @@ def main():
         sys.exit("viewer/ folder not found next to server.py.")
     if not CONFIG_PATH.exists():
         CONFIG_PATH.write_text(json.dumps(DEFAULT_CONFIG, indent=2) + "\n", encoding="utf-8")
-        print("Created config.json. Put your OpenAI API key in it to enable chat.")
+        print("Created config.json. Put your Anthropic API key in it to enable chat.")
     if not (VIEWER_DIR / "graph-data.js").exists() or not INDEX_PATH.exists():
         print("Heads up: no index yet. Run `python3 build.py /path/to/notes` and refresh the page.")
     try:
         cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-        if str(cfg.get("openai_api_key", "")).strip() in ("", PLACEHOLDER_KEY):
-            print("Chat is off until you paste an OpenAI API key into config.json (no restart needed).")
+        if str(cfg.get("anthropic_api_key", "")).strip() in ("", PLACEHOLDER_KEY):
+            print("Chat is off until you paste an Anthropic API key into config.json (no restart needed).")
     except (OSError, ValueError, AttributeError):
         print("Warning: config.json isn't valid JSON; /chat will report the problem.")
 

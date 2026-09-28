@@ -127,6 +127,42 @@
   #send:hover { transform: scale(1.06); }
   #send:disabled { opacity: .45; cursor: default; transform: none; }
   kbd { font: 11px var(--font); color: var(--muted); border: 1px solid var(--line); border-radius: 5px; padding: 1px 6px; }
+  .answer-text.muted { color: var(--muted); font-size: 13.5px; }
+
+  /* Voice: mic button */
+  #mic {
+    width: 40px; height: 40px; border-radius: 50%; flex: none; cursor: pointer; display: grid; place-items: center;
+    background: transparent; border: 1px solid var(--line-strong); color: #cfd6f3; transition: background .2s, border-color .2s, color .2s;
+  }
+  #mic:hover:not(:disabled) { background: rgba(255,255,255,.06); color: var(--text); }
+  #mic:disabled { opacity: .35; cursor: not-allowed; }
+  #mic[hidden] { display: none; }
+  #mic[aria-pressed="true"] { background: rgba(74,222,128,.14); border-color: rgba(74,222,128,.65); color: #86efac; animation: micring 1.8s infinite; }
+  @keyframes micring { 0% { box-shadow: 0 0 0 0 rgba(74,222,128,.45); } 70% { box-shadow: 0 0 0 10px rgba(74,222,128,0); } 100% { box-shadow: 0 0 0 0 rgba(74,222,128,0); } }
+
+  /* Voice: status line (who the machine thinks is talking) */
+  .vstatus {
+    align-self: flex-start; margin-left: 16px; position: relative; overflow: hidden;
+    display: inline-flex; align-items: center; gap: 8px; max-width: calc(100% - 32px);
+    padding: 4px 11px 5px 10px; border-radius: 999px; font-size: 11.5px; color: #b9c1dd;
+    background: rgba(9,12,26,.72); border: 1px solid var(--line); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+  }
+  .vstatus[hidden] { display: none; }
+  .vdot { width: 7px; height: 7px; border-radius: 50%; background: #5b6384; flex: none; }
+  .vwho { font-size: 9.5px; font-weight: 700; letter-spacing: .16em; text-transform: uppercase; color: #eef1fb; }
+  .vtext { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .vbar { position: absolute; left: 0; right: 0; bottom: 0; height: 2px; transform: scaleX(0); transform-origin: left; background: linear-gradient(90deg, #bef264, #4ade80); }
+  .vstatus[data-state="listening"] .vdot { background: #4ade80; box-shadow: 0 0 8px #4ade80; }
+  .vstatus[data-state="hearing"] .vdot { background: #4ade80; box-shadow: 0 0 10px #4ade80; animation: pulse .9s infinite ease-in-out; }
+  .vstatus[data-state="finishing"] .vdot { background: #bef264; box-shadow: 0 0 8px #bef264; }
+  .vstatus[data-state="finishing"] .vbar { animation: vfill var(--finish-ms, 900ms) linear forwards; }
+  .vstatus[data-state="thinking"] .vdot { background: #fbbf24; box-shadow: 0 0 8px #fbbf24; animation: pulse 1.1s infinite ease-in-out; }
+  .vstatus[data-state="speaking"] .vdot { background: #7dd3fc; box-shadow: 0 0 10px #7dd3fc; animation: pulse .7s infinite ease-in-out; }
+  .vstatus[data-state="speaking"] { border-color: rgba(125,211,252,.35); }
+  .vstatus[data-state="stopped"] .vdot { background: #f87171; }
+  .vstatus[data-state="error"] { color: #ffb4a8; border-color: rgba(248,113,113,.35); }
+  .vstatus[data-state="error"] .vdot { background: #f87171; }
+  @keyframes vfill { to { transform: scaleX(1); } }
 
   #notice {
     position: fixed; inset: 0; display: grid; place-items: center; padding: 24px; text-align: center; z-index: 10;
@@ -189,9 +225,15 @@
       <div class="neighbours" id="a-chips"></div>
     </div>
   </div>
+  <div class="vstatus" id="voice-status" data-state="idle" role="status" aria-live="polite">
+    <span class="vdot"></span><span class="vwho" hidden></span><span class="vtext">Loading voice…</span><span class="vbar"></span>
+  </div>
   <form id="ask" autocomplete="off">
     <input id="q" type="text" maxlength="1000" placeholder="Ask your notes anything…" aria-label="Ask your notes a question">
     <kbd id="kbd-hint">/</kbd>
+    <button id="mic" type="button" aria-label="Talk" aria-pressed="false">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>
+    </button>
     <button id="send" type="submit" aria-label="Ask">
       <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
     </button>
@@ -520,8 +562,8 @@ async function main() {
       return id;
     } catch { return 'default'; }
   })();
-  const answerEl = $('#answer'), input = $('#q'), sendBtn = $('#send');
-  let busy = false;
+  const answerEl = $('#answer'), input = $('#q');
+  let voice = null;                                     // set up below once voice.js loads
 
   function renderAnswer({ question, text, error, loading, ids = [] }) {
     answerEl.hidden = false;
@@ -547,32 +589,60 @@ async function main() {
     else if (valid.length > 1) { pauseRotation(4500); Graph.zoomToFit(1800, 90, (n) => state.lit.has(n.id)); }
   }
 
-  $('#ask').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const question = input.value.trim();
-    if (!question || busy) return;
-    busy = true; sendBtn.disabled = true;
+  // One path for every question, typed or spoken. A newer question (or "stop") replaces an older one in flight.
+  let askSeq = 0, inflight = null;
+  async function ask(raw) {
+    const question = String(raw || '').trim();
+    if (!question) return;
+    const seq = ++askSeq;
+    if (inflight) inflight.abort();
+    const controller = new AbortController();
+    inflight = controller;
+    input.value = question;
     renderAnswer({ question, loading: true });
+    voice?.setThinking(true);
     let data;
     try {
       const res = await fetch('/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ question, session: SESSION }),
+        signal: controller.signal,
       });
       data = await res.json().catch(() => ({ error: `The server answered ${res.status} without JSON.` }));
-    } catch {
+    } catch (err) {
+      if (err.name === 'AbortError') return;
       data = { error: "Can't reach the server. Is server.py still running?" };
     }
-    busy = false; sendBtn.disabled = false;
+    if (seq !== askSeq) return;
+    inflight = null;
+    voice?.setThinking(false);
     const ids = Array.isArray(data.nodes) ? data.nodes : [];
-    renderAnswer({ question, text: data.answer, error: data.error || (!data.answer && 'No answer came back.'), ids });
+    const error = data.error || (!data.answer && 'No answer came back.');
+    renderAnswer({ question, text: data.answer, error, ids });
     lightAnswer(ids);
-    if (!data.error) input.value = '';
+    if (!error && input.value === question) input.value = '';
+    voice?.say(error || data.answer);                   // every answer is spoken (errors too, so voice users hear them)
+  }
+
+  function cancelAsk() {
+    if (!inflight) return;
+    askSeq++;
+    inflight.abort();
+    inflight = null;
+    voice?.setThinking(false);
+    $('#a-body').innerHTML = '<p class="answer-text muted">Stopped.</p>';
+  }
+
+  $('#ask').addEventListener('submit', (e) => {
+    e.preventDefault();
+    voice?.discardPending();                            // a typed question wins over half-dictated words
+    ask(input.value);
   });
 
-  $('#a-close').addEventListener('click', () => { answerEl.hidden = true; clearHighlight(); });
+  $('#a-close').addEventListener('click', () => { voice?.stopSpeaking(); answerEl.hidden = true; clearHighlight(); });
   $('#a-new').addEventListener('click', async () => {
+    voice?.stopSpeaking(); cancelAsk();
     answerEl.hidden = true; input.value = ''; clearHighlight(); input.focus();
     try {
       await fetch('/chat/reset', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ session: SESSION }) });
@@ -582,6 +652,7 @@ async function main() {
   addEventListener('keydown', (e) => {
     if (e.key === '/' && document.activeElement !== input) { e.preventDefault(); input.focus(); }
     if (e.key === 'Escape') {
+      if (voice?.isSpeaking() || inflight) { voice?.stopSpeaking(); cancelAsk(); return; }   // Esc = "stop"
       if (document.activeElement === input && input.value) { input.value = ''; return; }
       clearHighlight(); input.blur();
     }
@@ -589,7 +660,24 @@ async function main() {
   input.addEventListener('focus', () => { $('#kbd-hint').style.visibility = 'hidden'; });
   input.addEventListener('blur', () => { $('#kbd-hint').style.visibility = ''; });
 
-  window.galaxy = { Graph, nodes, focusNode, clearHighlight };     // handy from the dev console
+  // ------------------------------------------------------------ voice (browser built-ins only)
+  try {
+    const { createVoice } = await import('./voice.js');
+    voice = createVoice({
+      micButton: $('#mic'),
+      statusEl: $('#voice-status'),
+      input,
+      onThought: (text) => ask(text),                   // a finished spoken thought goes through the same flow as typing
+      onInterrupt: () => cancelAsk(),                   // "stop" / "wait": abandon a question still being answered
+    });
+    voice.greet(`Galaxy online. ${nodes.length} notes loaded.`);   // held until your first click
+  } catch (err) {
+    console.warn('Voice unavailable', err);
+    $('#mic').hidden = true;
+    $('#voice-status').hidden = true;
+  }
+
+  window.galaxy = { Graph, nodes, focusNode, clearHighlight, ask };  // handy from the dev console
 }
 
 main().catch((err) => {
